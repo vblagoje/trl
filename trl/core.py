@@ -5,13 +5,13 @@ __all__ = ['flatten_dict', 'stack_dicts', 'add_suffix', 'pad_to_size', 'logprobs
            'RLMixin']
 
 # Cell
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
 import torch
 import torch.nn.functional as F
 import collections
 import numpy as np
 from transformers.file_utils import ModelOutput
-from transformers.generation_utils import GenerationMixin, top_k_top_p_filtering
+from transformers import top_k_top_p_filtering
 
 # Cell
 def flatten_dict(nested, sep='/'):
@@ -129,7 +129,7 @@ def build_bert_batch_from_txt(text_list, tokenizer, device):
     return padded_tensors, attention_masks
 
 # Cell
-class RLMixin(GenerationMixin):
+class RLMixin:
 
     def respond_to_batch(
             self,
@@ -182,7 +182,7 @@ class RLMixin(GenerationMixin):
 
         # special case if pad_token_id is not defined
         if pad_token_id is None and eos_token_id is not None:
-            print(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
+            # print(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
             pad_token_id = eos_token_id
 
         # Storing encoder_input_ids for logits_processor that could use them
@@ -267,3 +267,139 @@ class RLMixin(GenerationMixin):
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
         return input_ids[:, -gen_length:]
+
+    def _prepare_input_ids_for_generation(self, bos_token_id: int) -> torch.LongTensor:
+        if bos_token_id is None:
+            raise ValueError("`bos_token_id` has to be defined when no `input_ids` are provided.")
+        return torch.ones((1, 1), dtype=torch.long, device=self.device) * bos_token_id
+
+    def _prepare_attention_mask_for_generation(
+            self, input_ids: torch.Tensor, pad_token_id: int, eos_token_id: int
+    ) -> torch.LongTensor:
+        is_pad_token_in_inputs_ids = (pad_token_id is not None) and (pad_token_id in input_ids)
+        is_pad_token_not_equal_to_eos_token_id = (eos_token_id is None) or (
+                (eos_token_id is not None) and (pad_token_id != eos_token_id)
+        )
+        if is_pad_token_in_inputs_ids and is_pad_token_not_equal_to_eos_token_id:
+            return input_ids.ne(pad_token_id).long()
+        return input_ids.new_ones(input_ids.shape)
+
+    def _prepare_encoder_decoder_kwargs_for_generation(
+            self, input_ids: torch.LongTensor, model_kwargs
+    ) -> Dict[str, Any]:
+        # retrieve encoder hidden states
+        encoder = self.get_encoder()
+        encoder_kwargs = {
+            argument: value for argument, value in model_kwargs.items() if not argument.startswith("decoder_")
+        }
+        model_kwargs["encoder_outputs"]: ModelOutput = encoder(input_ids, return_dict=True, **encoder_kwargs)
+        return model_kwargs
+
+    def _prepare_decoder_input_ids_for_generation(
+            self, input_ids: torch.LongTensor, decoder_start_token_id: int = None, bos_token_id: int = None
+    ) -> torch.LongTensor:
+        decoder_start_token_id = self._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
+        decoder_input_ids = (
+                torch.ones((input_ids.shape[0], 1), dtype=input_ids.dtype, device=input_ids.device)
+                * decoder_start_token_id
+        )
+        return decoder_input_ids
+
+    def _get_decoder_start_token_id(self, decoder_start_token_id: int = None, bos_token_id: int = None) -> int:
+        decoder_start_token_id = (
+            decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
+        )
+        bos_token_id = bos_token_id if bos_token_id is not None else self.config.bos_token_id
+
+        if decoder_start_token_id is not None:
+            return decoder_start_token_id
+        elif (
+                hasattr(self.config, "decoder")
+                and hasattr(self.config.decoder, "decoder_start_token_id")
+                and self.config.decoder.decoder_start_token_id is not None
+        ):
+            return self.config.decoder.decoder_start_token_id
+        elif bos_token_id is not None:
+            return bos_token_id
+        elif (
+                hasattr(self.config, "decoder")
+                and hasattr(self.config.decoder, "bos_token_id")
+                and self.config.decoder.bos_token_id is not None
+        ):
+            return self.config.decoder.bos_token_id
+        raise ValueError(
+            "`decoder_start_token_id` or `bos_token_id` has to be defined for encoder-decoder generation."
+        )
+
+    @staticmethod
+    def _expand_inputs_for_generation(
+            input_ids: torch.LongTensor,
+            expand_size: int = 1,
+            is_encoder_decoder: bool = False,
+            attention_mask: torch.LongTensor = None,
+            encoder_outputs: ModelOutput = None,
+            **model_kwargs,
+    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        expanded_return_idx = (
+            torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, expand_size).view(-1).to(input_ids.device)
+        )
+        input_ids = input_ids.index_select(0, expanded_return_idx)
+
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = token_type_ids.index_select(0, expanded_return_idx)
+
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask.index_select(0, expanded_return_idx)
+
+        if is_encoder_decoder:
+            assert encoder_outputs is not None
+            encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
+                0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
+            )
+            model_kwargs["encoder_outputs"] = encoder_outputs
+        return input_ids, model_kwargs
+
+    @staticmethod
+    def _update_seq_length_for_generation(
+            sequence_lengths: torch.LongTensor,
+            unfinished_sequences: torch.LongTensor,
+            cur_len: int,
+            is_eos_in_next_token: torch.BoolTensor,
+    ) -> Tuple[torch.LongTensor, torch.LongTensor]:
+        # check if sentence is not finished yet
+        is_sent_unfinished = unfinished_sequences.mul(is_eos_in_next_token.long()).bool()
+
+        # update sentence length
+        sequence_lengths = sequence_lengths.masked_fill(is_sent_unfinished, cur_len)
+        unfinished_sequences = unfinished_sequences.mul((~is_eos_in_next_token).long())
+        return sequence_lengths, unfinished_sequences
+
+    @staticmethod
+    def _update_model_kwargs_for_generation(
+            outputs: ModelOutput, model_kwargs: Dict[str, Any], is_encoder_decoder: bool = False
+    ) -> Dict[str, Any]:
+        # update past
+        if "past_key_values" in outputs:
+            model_kwargs["past"] = outputs.past_key_values
+        elif "mems" in outputs:
+            model_kwargs["past"] = outputs.mems
+        elif "past_buckets_states" in outputs:
+            model_kwargs["past"] = outputs.past_buckets_states
+        else:
+            model_kwargs["past"] = None
+
+        # update token_type_ids with last value
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = torch.cat([token_type_ids, token_type_ids[:, -1].unsqueeze(-1)], dim=-1)
+
+        # update attention mask
+        if not is_encoder_decoder:
+            if "attention_mask" in model_kwargs:
+                attention_mask = model_kwargs["attention_mask"]
+                model_kwargs["attention_mask"] = torch.cat(
+                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                )
+
+        return model_kwargs
