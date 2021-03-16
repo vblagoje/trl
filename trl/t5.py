@@ -18,10 +18,12 @@ class T5ValueHead(nn.Module):
     """The ValueHead class implements a head for T5 that returns a scalar for each output token."""
     def __init__(self, config):
         super().__init__()
-        self.state_representation = nn.Linear(config.vocab_size, 1)
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.state_representation = nn.Linear(config.hidden_size, 1)
 
     def forward(self, hidden_states):
-        output = self.state_representation(hidden_states)
+        output = self.dropout(hidden_states)
+        output = self.state_representation(output)
         return output
 
 # Cell
@@ -51,7 +53,7 @@ class T5HeadWithValueModel(T5ForConditionalGeneration, RLMixin):
         return_dict=None
     ):
 
-        transformer_output = super().forward(
+        transformer_outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
@@ -69,7 +71,7 @@ class T5HeadWithValueModel(T5ForConditionalGeneration, RLMixin):
             return_dict=True
         )
 
-
-        value = self.v_head(transformer_output[0]).squeeze(-1)
-
-        return transformer_output
+        hidden_states = transformer_outputs.decoder_hidden_states
+        value = self.v_head(hidden_states[0]).squeeze(-1)
+        transformer_outputs["state_value"] = value
+        return transformer_outputs
