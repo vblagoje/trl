@@ -177,12 +177,13 @@ class PPOTrainer:
 
         for i in range(int(self.ppo_params['batch_size']/fbs)):
             m_input = model_input[i*fbs:(i+1)*fbs]
-            logits, _, v = self.model(m_input)
-            ref_logits, _, _ = self.ref_model(m_input)
+            output = self.model(m_input)
+            ref_output = self.ref_model(m_input)
 
-            values.append(v[:, -gen_len-1:-1].detach())
-            logprobs.append(logprobs_from_logits(logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].detach())
-            ref_logprobs.append(logprobs_from_logits(ref_logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].detach())
+            values.append(output.state_values[:, -gen_len-1:-1].detach())
+            logprobs.append(logprobs_from_logits(output.logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].detach())
+            ref_logprobs.append(logprobs_from_logits(ref_output.logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].detach())
+
 
         return torch.cat(logprobs), torch.cat(ref_logprobs), torch.cat(values)
 
@@ -220,11 +221,11 @@ class PPOTrainer:
         advantages = whiten(advantages)
         advantages = advantages.detach()
 
-        logits, _, vpred = self.model(model_input)
-        logprob = logprobs_from_logits(logits[:,:-1,:], model_input[:, 1:])
+        output = self.model(model_input)
+        logprob = logprobs_from_logits(output.logits[:,:-1,:], model_input[:, 1:])
 
         #only the generation part of the values/logprobs is needed
-        logprob, vpred = logprob[:, -gen_len:], vpred[:,-gen_len-1:-1]
+        logprob, vpred = logprob[:, -gen_len:], output.state_values[:,-gen_len-1:-1]
 
         vpredclipped = clip_by_value(vpred,
                                      values - self.ppo_params["cliprange_value"],
@@ -247,7 +248,7 @@ class PPOTrainer:
 
         loss = pg_loss + self.ppo_params['vf_coef'] * vf_loss
 
-        entropy = torch.mean(entropy_from_logits(logits))
+        entropy = torch.mean(entropy_from_logits(output.logits))
         approxkl = .5 * torch.mean((logprob - old_logprobs)**2)
         policykl = torch.mean(logprob - old_logprobs)
         return_mean, return_var = torch.mean(returns), torch.var(returns)

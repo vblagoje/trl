@@ -84,9 +84,12 @@ class GPT2HeadWithValueModel(GPT2PreTrainedModel):
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        mc_token_ids=None,
-        lm_labels=None,
-        mc_labels=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
     ):
 
         transformer_outputs = self.transformer(
@@ -97,16 +100,17 @@ class GPT2HeadWithValueModel(GPT2PreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            output_hidden_states=True,
+            return_dict=True
         )
 
         hidden_states = transformer_outputs[0]
 
         lm_logits = self.lm_head(hidden_states)
         value = self.v_head(hidden_states).squeeze(-1)
-
-        outputs = (lm_logits,) + transformer_outputs[1:] + (value,)
-
-        return outputs
+        transformer_outputs["logits"] = lm_logits
+        transformer_outputs["state_values"] = value
+        return transformer_outputs
 
 # Cell
 
@@ -115,8 +119,8 @@ def respond_to_batch(model, queries, txt_len=20, top_k=0, top_p=1.0):
     input_ids = queries
     for i in range(txt_len):
         # Get Logits
-        outputs = model(input_ids)
-        next_token_logits = outputs[0][:, -1, :]
+        outputs = model(input_ids, return_dict=True)
+        next_token_logits = outputs.logits[:, -1, :]
         next_token_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
         # Sample
         probs = F.softmax(next_token_logits, dim=-1)
