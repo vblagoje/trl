@@ -4,12 +4,13 @@ __all__ = ['ValueHead', 'GPT2HeadWithValueModel', 'respond_to_batch']
 
 # Cell
 
-from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Model, GPT2PreTrainedModel
-from transformers import top_k_top_p_filtering
+import torch
+import torch.nn.functional as F
+from typing import *
 from torch import nn
 from torch.nn import Identity
-import torch.nn.functional as F
-import torch
+from transformers import GPT2Tokenizer, GPT2Model, GPT2PreTrainedModel
+from transformers import top_k_top_p_filtering
 
 # Cell
 
@@ -114,16 +115,91 @@ class GPT2HeadWithValueModel(GPT2PreTrainedModel):
 
 # Cell
 
-def respond_to_batch(model, queries, txt_len=20, top_k=0, top_p=1.0):
+def respond_to_batch(model, input_ids, txt_len=20, top_k=0, top_p=1.0, **model_kwargs):
     """Sample text from language model."""
-    input_ids = queries
+
+    model_kwargs["output_attentions"] = False
+    model_kwargs["output_hidden_states"] = False
+
+    if model.config.is_encoder_decoder:
+        # add encoder_outputs to model_kwargs
+        model_kwargs = _prepare_encoder_decoder_kwargs_for_generation(model, input_ids, model_kwargs)
+
+        # set input_ids as decoder_input_ids
+        if "decoder_input_ids" in model_kwargs:
+            input_ids = model_kwargs.pop("decoder_input_ids")
+        else:
+            input_ids = _prepare_decoder_input_ids_for_generation(model,
+                input_ids,
+                decoder_start_token_id=None,
+                bos_token_id=model.config.bos_token_id
+            )
+
     for i in range(txt_len):
-        # Get Logits
-        outputs = model(input_ids, return_dict=True)
+
+        model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
+        outputs = model(**model_inputs, return_dict=True)
         next_token_logits = outputs.logits[:, -1, :]
         next_token_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
         # Sample
         probs = F.softmax(next_token_logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
         input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
+        eods = (next_token == model.config.eos_token_id)
+        #torch.any(eods,0).item()
+        #if next_token.squeeze(-1).item() == model.config.eos_token_id:
+        #    break
+        if torch.any(eods,0).item():
+            break
     return input_ids[:, -txt_len:]
+
+
+def _prepare_encoder_decoder_kwargs_for_generation(
+        model, input_ids: torch.LongTensor, model_kwargs
+    ) -> Dict[str, Any]:
+        # retrieve encoder hidden states
+        encoder = model.get_encoder()
+        encoder_kwargs = {
+            argument: value for argument, value in model_kwargs.items() if not argument.startswith("decoder_")
+        }
+        model_kwargs["encoder_outputs"]: Dict = encoder(input_ids, return_dict=True, **encoder_kwargs)
+        return model_kwargs
+
+
+def _prepare_decoder_input_ids_for_generation(model, input_ids: torch.LongTensor,
+                                              decoder_start_token_id: int = None,
+                                              bos_token_id: int = None
+    ) -> torch.LongTensor:
+        decoder_start_token_id = _get_decoder_start_token_id(model, decoder_start_token_id, bos_token_id)
+        decoder_input_ids = (
+            torch.ones((input_ids.shape[0], 1), dtype=input_ids.dtype, device=input_ids.device)
+            * decoder_start_token_id
+        )
+        return decoder_input_ids
+
+
+def _get_decoder_start_token_id(model, decoder_start_token_id: int = None, bos_token_id: int = None) -> int:
+    decoder_start_token_id = (
+        decoder_start_token_id if decoder_start_token_id is not None else model.config.decoder_start_token_id
+    )
+    bos_token_id = bos_token_id if bos_token_id is not None else model.config.bos_token_id
+
+    if decoder_start_token_id is not None:
+        return decoder_start_token_id
+    elif (
+        hasattr(model.config, "decoder")
+        and hasattr(model.config.decoder, "decoder_start_token_id")
+        and model.config.decoder.decoder_start_token_id is not None
+    ):
+        return model.config.decoder.decoder_start_token_id
+    elif bos_token_id is not None:
+        return bos_token_id
+    elif (
+        hasattr(model.config, "decoder")
+        and hasattr(model.config.decoder, "bos_token_id")
+        and model.config.decoder.bos_token_id is not None
+    ):
+        return model.config.decoder.bos_token_id
+    raise ValueError(
+        "`decoder_start_token_id` or `bos_token_id` has to be defined for encoder-decoder generation."
+    )

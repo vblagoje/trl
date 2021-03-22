@@ -18,11 +18,14 @@ index = {"flatten_dict": "00-core.ipynb",
          "respond_to_batch": "01-gpt2-with-value-head.ipynb",
          "AdaptiveKLController": "02-ppo.ipynb",
          "FixedKLController": "02-ppo.ipynb",
-         "PPOTrainer": "02-ppo.ipynb"}
+         "PPOTrainer": "02-ppo.ipynb",
+         "T5ValueHead": "06-t5-with-value-head.ipynb",
+         "T5HeadWithValueModel": "06-t5-with-value-head.ipynb"}
 
 modules = ["core.py",
            "gpt2.py",
-           "ppo.py"]
+           "ppo.py",
+           "t5.py"]
 
 doc_url = "https://lvwerra.github.io/trl/"
 
