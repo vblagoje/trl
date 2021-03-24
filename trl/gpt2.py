@@ -9,10 +9,11 @@ import torch.nn.functional as F
 from typing import *
 from torch import nn
 from torch.nn import Identity
-from transformers import GPT2Tokenizer, GPT2Model, GPT2PreTrainedModel
+from transformers import GPT2Model, GPT2PreTrainedModel
 from transformers import top_k_top_p_filtering
 
 # Cell
+
 
 class ValueHead(nn.Module):
     """The ValueHead class implements a head for GPT2 that returns a scalar for each output token."""
@@ -115,11 +116,21 @@ class GPT2HeadWithValueModel(GPT2PreTrainedModel):
 
 # Cell
 
-def respond_to_batch(model, input_ids, txt_len=20, top_k=0, top_p=1.0, **model_kwargs):
+def respond_to_batch(model, input_ids,
+                     pad_token_id:Optional[int] = None,
+                     bos_token_id:Optional[int] = None,
+                     eos_token_id:Optional[int] = None,
+                     txt_len=128, top_k=0, top_p=1.0,
+                     **model_kwargs):
+    
     """Sample text from language model."""
 
     model_kwargs["output_attentions"] = False
     model_kwargs["output_hidden_states"] = False
+
+    pad_token_id = pad_token_id if pad_token_id is not None else model.config.pad_token_id
+    bos_token_id = bos_token_id if bos_token_id is not None else model.config.bos_token_id
+    eos_token_id = eos_token_id if eos_token_id is not None else model.config.eos_token_id
 
     if model.config.is_encoder_decoder:
         # add encoder_outputs to model_kwargs
@@ -135,7 +146,12 @@ def respond_to_batch(model, input_ids, txt_len=20, top_k=0, top_p=1.0, **model_k
                 bos_token_id=model.config.bos_token_id
             )
 
-    for i in range(txt_len):
+    # init sequence length tensors
+    sequence_lengths, unfinished_sequences, cur_len = _init_sequence_length_for_generation(
+            input_ids, txt_len
+    )
+
+    while cur_len < txt_len:
 
         model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
         outputs = model(**model_inputs, return_dict=True)
@@ -143,15 +159,33 @@ def respond_to_batch(model, input_ids, txt_len=20, top_k=0, top_p=1.0, **model_k
         next_token_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
         # Sample
         probs = F.softmax(next_token_logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
-        input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
-        eods = (next_token == model.config.eos_token_id)
-        #torch.any(eods,0).item()
-        #if next_token.squeeze(-1).item() == model.config.eos_token_id:
-        #    break
-        if torch.any(eods,0).item():
+        next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+        # add code that transfomers next_tokens to tokens_to_add
+        if eos_token_id is not None:
+            assert pad_token_id is not None, "If eos_token_id is defined, make sure that pad_token_id is defined."
+            next_tokens = next_tokens * unfinished_sequences + (pad_token_id) * (1 - unfinished_sequences)
+
+        # add token and increase length by one
+        input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+        cur_len = cur_len + 1
+
+        # update sequence length
+        if eos_token_id is not None:
+            sequence_lengths, unfinished_sequences = _update_seq_length_for_generation(
+                sequence_lengths, unfinished_sequences, cur_len, next_tokens == eos_token_id
+            )
+
+        # stop when there is a </s> in each sentence, or if we exceed the maximul length
+        if unfinished_sequences.max() == 0:
             break
-    return input_ids[:, -txt_len:]
+
+        # update model kwargs
+        model_kwargs = _update_model_kwargs_for_generation(
+            outputs, model_kwargs, is_encoder_decoder=model.config.is_encoder_decoder
+        )
+
+    return input_ids
 
 
 def _prepare_encoder_decoder_kwargs_for_generation(
@@ -203,3 +237,57 @@ def _get_decoder_start_token_id(model, decoder_start_token_id: int = None, bos_t
     raise ValueError(
         "`decoder_start_token_id` or `bos_token_id` has to be defined for encoder-decoder generation."
     )
+
+
+def _init_sequence_length_for_generation(
+        input_ids: torch.LongTensor, max_length: int
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
+    sequence_lengths = input_ids.new(input_ids.shape[0]).fill_(max_length)
+
+    cur_len = input_ids.shape[-1]
+    return sequence_lengths, unfinished_sequences, cur_len
+
+
+def _update_seq_length_for_generation(
+        sequence_lengths: torch.LongTensor,
+        unfinished_sequences: torch.LongTensor,
+        cur_len: int,
+        is_eos_in_next_token: torch.BoolTensor,
+) -> Tuple[torch.LongTensor, torch.LongTensor]:
+    # check if sentence is not finished yet
+    is_sent_unfinished = unfinished_sequences.mul(is_eos_in_next_token.long()).bool()
+
+    # update sentence length
+    sequence_lengths = sequence_lengths.masked_fill(is_sent_unfinished, cur_len)
+    unfinished_sequences = unfinished_sequences.mul((~is_eos_in_next_token).long())
+    return sequence_lengths, unfinished_sequences
+
+
+def _update_model_kwargs_for_generation(
+        outputs: OrderedDict, model_kwargs: Dict[str, Any], is_encoder_decoder: bool = False
+) -> Dict[str, Any]:
+    # update past
+    if "past_key_values" in outputs:
+        model_kwargs["past"] = outputs.past_key_values
+    elif "mems" in outputs:
+        model_kwargs["past"] = outputs.mems
+    elif "past_buckets_states" in outputs:
+        model_kwargs["past"] = outputs.past_buckets_states
+    else:
+        model_kwargs["past"] = None
+
+    # update token_type_ids with last value
+    if "token_type_ids" in model_kwargs:
+        token_type_ids = model_kwargs["token_type_ids"]
+        model_kwargs["token_type_ids"] = torch.cat([token_type_ids, token_type_ids[:, -1].unsqueeze(-1)], dim=-1)
+
+    # update attention mask
+    if not is_encoder_decoder:
+        if "attention_mask" in model_kwargs:
+            attention_mask = model_kwargs["attention_mask"]
+            model_kwargs["attention_mask"] = torch.cat(
+                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+            )
+
+    return model_kwargs
