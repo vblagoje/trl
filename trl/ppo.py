@@ -125,10 +125,10 @@ class PPOTrainer:
         t0 = time.time()
 
         gen_len = response.shape[1]
-        model_input = torch.cat((query, response), axis=1)
+        #model_input = torch.cat((query, response), axis=1)
 
         t = time.time()
-        logprobs, ref_logprobs, values = self.batched_forward_pass(model_input, gen_len)
+        logprobs, ref_logprobs, values = self.batched_forward_pass(query, response, gen_len)
         timing['time/ppo/forward_pass'] = time.time()-t
 
         t = time.time()
@@ -144,7 +144,7 @@ class PPOTrainer:
                 idx = idxs[i]
                 train_stats = self.train_minibatch(logprobs[idx:idx+1], values[idx:idx+1],
                                                    rewards[idx:idx+1], query[idx:idx+1],
-                                                   response[idx:idx+1], model_input[idx:idx+1])
+                                                   response[idx:idx+1])
                 all_stats.append(train_stats)
         timing['time/ppo/optimize_step'] = time.time()-t
 
@@ -167,7 +167,7 @@ class PPOTrainer:
         stats.update(timing)
         return stats
 
-    def batched_forward_pass(self, model_input, gen_len):
+    def batched_forward_pass(self, prompts, responses, gen_len):
         """Calculate model outputs in multiple batches."""
         bs = self.ppo_params['batch_size']
         fbs = self.ppo_params['forward_batch_size']
@@ -176,20 +176,23 @@ class PPOTrainer:
         values = []
 
         for i in range(int(self.ppo_params['batch_size']/fbs)):
-            m_input = model_input[i*fbs:(i+1)*fbs]
-            output = self.model(m_input)
-            ref_output = self.ref_model(m_input)
+            input_ids = prompts[i*fbs:(i+1)*fbs]
+            decoder_input_ids = responses[i * fbs:(i + 1) * fbs]
+            m_decoder_input_ids = self.model._shift_right(decoder_input_ids)
+            output = self.model(input_ids=input_ids, decoder_input_ids=m_decoder_input_ids)
+            ref_m_decoder_input_ids = self.ref_model._shift_right(decoder_input_ids)
+            ref_output = self.ref_model(input_ids=prompts, decoder_input_ids=ref_m_decoder_input_ids)
 
-            values.append(output.state_values[:, -gen_len-1:-1].detach())
-            logprobs.append(logprobs_from_logits(output.logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].detach())
-            ref_logprobs.append(logprobs_from_logits(ref_output.logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].detach())
+            values.append(output.state_values.detach())
+            logprobs.append(logprobs_from_logits(output.logits, m_decoder_input_ids).detach())
+            ref_logprobs.append(logprobs_from_logits(ref_output.logits, ref_m_decoder_input_ids).detach())
 
 
         return torch.cat(logprobs), torch.cat(ref_logprobs), torch.cat(values)
 
-    def train_minibatch(self, logprobs, values, rewards, query, response, model_input):
+    def train_minibatch(self, logprobs, values, rewards, query, response):
         """Train one PPO minibatch"""
-        loss_p, loss_v, train_stats  = self.loss(logprobs, values, rewards, query, response, model_input)
+        loss_p, loss_v, train_stats  = self.loss(logprobs, values, rewards, query, response)
         loss = loss_p + loss_v
         self.optimizer.zero_grad()
         loss.backward()
@@ -204,7 +207,7 @@ class PPOTrainer:
         rewards[:, -1] += scores
         return rewards, non_score_reward, self.kl_ctl.value
 
-    def loss(self, old_logprobs, values, rewards, query, response, model_input):
+    def loss(self, old_logprobs, values, rewards, query, response):
         """Calculate policy and value losses."""
         lastgaelam = 0
         advantages_reversed = []
@@ -220,12 +223,13 @@ class PPOTrainer:
         returns = advantages + values
         advantages = whiten(advantages)
         advantages = advantages.detach()
+        decoder_input_ids = self.model._shift_right(response)
+        output = self.model(input_ids=query, decoder_input_ids=decoder_input_ids)
 
-        output = self.model(model_input)
-        logprob = logprobs_from_logits(output.logits[:,:-1,:], model_input[:, 1:])
+        logprob = logprobs_from_logits(output.logits, decoder_input_ids)
 
         #only the generation part of the values/logprobs is needed
-        logprob, vpred = logprob[:, -gen_len:], output.state_values[:,-gen_len-1:-1]
+        logprob, vpred = logprob, output.state_values
 
         vpredclipped = clip_by_value(vpred,
                                      values - self.ppo_params["cliprange_value"],
