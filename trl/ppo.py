@@ -181,7 +181,7 @@ class PPOTrainer:
             m_decoder_input_ids = self.model._shift_right(decoder_input_ids)
             output = self.model(input_ids=input_ids, decoder_input_ids=m_decoder_input_ids)
             ref_m_decoder_input_ids = self.ref_model._shift_right(decoder_input_ids)
-            ref_output = self.ref_model(input_ids=prompts, decoder_input_ids=ref_m_decoder_input_ids)
+            ref_output = self.ref_model(input_ids=input_ids, decoder_input_ids=ref_m_decoder_input_ids)
 
             values.append(output.state_values.detach())
             logprobs.append(logprobs_from_logits(output.logits, m_decoder_input_ids).detach())
